@@ -143,6 +143,17 @@ jobs:
           button += '                }' + NL
           src = src.replace(anchor2, button + anchor2, 1)
           write(sv, src)
+
+          # ---- 4) 钥匙串查询不再指定 access group（否则 Sideloadly/iloader 签名时必然 -34018）----
+          src = read(store)
+          old_q = 'kSecAttrAccount as String: "default", kSecAttrAccessGroup as String: group]'
+          new_q = 'kSecAttrAccount as String: "default"]'
+          if old_q not in src:
+              sys.exit("keychain anchor missing")
+          src = src.replace(old_q, new_q, 1)
+          write(store, src)
+          print("keychain access group removed")
+
           print("patched for no-App-Group mode")
           PY
       - name: Build device app without signing (Release)
