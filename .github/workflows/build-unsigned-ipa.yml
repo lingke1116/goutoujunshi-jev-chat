@@ -25,68 +25,126 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Patch credential storage (App Group mirror, no hardcoded keychain group)
+      - name: Patch app to work without App Group (container fallback + clipboard bootstrap)
         run: |
           python3 - <<'PY'
           import sys
-          path = "Shared/Store.swift"
-          lines = open(path, encoding="utf-8").read().split("\n")
+          NL = chr(10)
 
-          hit = 0
-          for i, l in enumerate(lines):
-              if "kSecAttrAccessGroup as String: group]" in l:
-                  lines[i] = l.replace(", kSecAttrAccessGroup as String: group]", "]")
-                  hit += 1
-          if hit != 1:
-              sys.exit("anchor access-group count = %d" % hit)
+          def read(p):
+              return open(p, encoding="utf-8").read()
 
-          exact = {
-              "    static func read(_ name: String) throws -> String {": "    private static func keychainRead(_ name: String) throws -> String {",
-              "    static func write(_ value: String, name: String) throws {": "    private static func keychainWrite(_ value: String, name: String) throws {",
-              "    static func delete(_ name: String) throws {": "    private static func keychainDelete(_ name: String) throws {",
+          def write(p, text):
+              open(p, "w", encoding="utf-8").write(text)
+
+          # ---- 1) Shared/Store.swift: App Group 变可选 ----
+          store = "Shared/Store.swift"
+          src = read(store)
+          old_init = '''        #if os(iOS)
+                  guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.group),
+                        let defaults = UserDefaults(suiteName: Self.group) else {
+                      throw GoutouError.invalid("共享配置未连接：请在 Xcode 为 App 与键盘配置相同 App Group 和开发者 Team")
+                  }
+                  self.container = container
+                  self.defaults = defaults
+                  #else'''
+          new_init = '''        #if os(iOS)
+                  if let groupContainer = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.group),
+                     let groupDefaults = UserDefaults(suiteName: Self.group) {
+                      self.container = groupContainer
+                      self.defaults = groupDefaults
+                  } else {
+                      let fallback = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+                      self.container = fallback
+                      self.defaults = UserDefaults.standard
+                  }
+                  #else'''
+          if old_init not in src:
+              sys.exit("store init anchor missing")
+          src = src.replace(old_init, new_init, 1)
+          write(store, src)
+
+          # ---- 1b) 追加剪贴板兜底通道 ----
+          bootstrap = '''
+
+          #if os(iOS) && !GOUTOU_CAPTURE
+          import UIKit
+
+          /// App Group 不可用时的兜底：主 App 把配置与 Key 复制到剪贴板，键盘读取后存进自己的容器和钥匙串。
+          enum GoutouBootstrap {
+              static let marker = "goutou-bootstrap-1"
+
+              struct Payload: Codable {
+                  var marker: String
+                  var savedAt: Date
+                  var config: AppConfig
+                  var relationship: Relationship
+                  var secrets: [String: String]
+              }
+
+              static func copyToPasteboard(store: GoutouStore) -> Bool {
+                  var secrets: [String: String] = [:]
+                  for name in CredentialVault.services {
+                      secrets[name] = (try? CredentialVault.read(name)) ?? ""
+                  }
+                  let payload = Payload(marker: marker, savedAt: Date(), config: store.config(),
+                                        relationship: store.relationship(), secrets: secrets)
+                  guard let data = try? JSONEncoder().encode(payload), let text = String(data: data, encoding: .utf8) else { return false }
+                  UIPasteboard.general.string = text
+                  return true
+              }
+
+              @discardableResult
+              static func importIfNewer(into store: GoutouStore) -> Bool {
+                  guard let text = UIPasteboard.general.string, let data = text.data(using: .utf8),
+                        let payload = try? JSONDecoder().decode(Payload.self, from: data), payload.marker == marker else { return false }
+                  guard payload.savedAt > store.bootstrapImportedAt else { return false }
+                  _ = try? store.saveConfig(payload.config)
+                  _ = try? store.saveRelationship(payload.relationship, archive: true)
+                  for (name, value) in payload.secrets where !value.trimmed.isEmpty {
+                      _ = try? CredentialVault.write(value, name: name)
+                  }
+                  store.bootstrapImportedAt = payload.savedAt
+                  return true
+              }
           }
-          for i, l in enumerate(lines):
-              if l in exact:
-                  lines[i] = exact[l]
 
-          insert_at = None
-          for i, l in enumerate(lines):
-              if "private static func keychainDelete(_ name: String) throws {" in l:
-                  j = i
-                  while j < len(lines) and not lines[j].startswith("    #else"):
-                      j += 1
-                  insert_at = j
-                  break
-          if insert_at is None:
-              sys.exit("insert anchor not found")
+          extension GoutouStore {
+              var bootstrapImportedAt: Date {
+                  get { defaults.object(forKey: "goutou.bootstrap.importedAt") as? Date ?? Date(timeIntervalSince1970: 0) }
+                  set { defaults.set(newValue, forKey: "goutou.bootstrap.importedAt") }
+              }
+          }
+          #endif
+          '''
+          write(store, read(store) + bootstrap)
 
-          wrappers = [
-              '    private static var mirror: UserDefaults? {',
-              '        guard let group = Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String, !group.isEmpty else { return nil }',
-              '        return UserDefaults(suiteName: group)',
-              '    }',
-              '    private static func mirrorKey(_ name: String) -> String { "goutou.secret." + name }',
-              '    static func read(_ name: String) throws -> String {',
-              '        if let value = try? keychainRead(name), !value.isEmpty { return value }',
-              '        return mirror?.string(forKey: mirrorKey(name)) ?? ""',
-              '    }',
-              '    static func write(_ value: String, name: String) throws {',
-              '        let value = value.trimmed',
-              '        guard !value.isEmpty, value.count <= 1024 else { throw GoutouError.invalid("请输入有效的 API Key") }',
-              '        let saved = (try? keychainWrite(value, name: name)) != nil',
-              '        mirror?.set(value, forKey: mirrorKey(name))',
-              '        guard saved || mirror != nil else { throw GoutouError.invalid("密钥保存失败，请检查共享钥匙串签名") }',
-              '    }',
-              '    static func delete(_ name: String) throws {',
-              '        try? keychainDelete(name)',
-              '        mirror?.removeObject(forKey: mirrorKey(name))',
-              '    }',
-          ]
-          lines[insert_at:insert_at] = wrappers
-          open(path, "w", encoding="utf-8").write("\n".join(lines))
-          print("patched", path, len(lines), "lines")
+          # ---- 2) 键盘启动时自动从剪贴板导入 ----
+          kb = "Keyboard/Sources/KeyboardViewController.swift"
+          src = read(kb)
+          anchor = "            store = try GoutouStore()"
+          if anchor not in src:
+              sys.exit("keyboard anchor missing")
+          src = src.replace(anchor, anchor + NL + "            if let active = store { _ = GoutouBootstrap.importIfNewer(into: active) }", 1)
+          write(kb, src)
+
+          # ---- 3) 主 App 增加复制配置按钮 ----
+          sv = "App/Sources/SettingsViews.swift"
+          src = read(sv)
+          anchor2 = '                Button("清除键盘暂存与等待取用的内容") {'
+          if anchor2 not in src:
+              sys.exit("settings anchor missing")
+          button = '                Button("复制配置给键盘（无 App Group 时用）") {' + NL
+          button += '                    if let store = model.store, GoutouBootstrap.copyToPasteboard(store: store) {' + NL
+          button += '                        message = "已复制配置到剪贴板；切到键盘会自动导入。"' + NL
+          button += '                    } else {' + NL
+          button += '                        message = "共享配置未连接，复制失败。"' + NL
+          button += '                    }' + NL
+          button += '                }' + NL
+          src = src.replace(anchor2, button + anchor2, 1)
+          write(sv, src)
+          print("patched for no-App-Group mode")
           PY
-
       - name: Build device app without signing (Release)
         run: >
           xcodebuild -project GoutouJunshi.xcodeproj -scheme GoutouJunshi
