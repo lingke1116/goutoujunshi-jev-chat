@@ -27,6 +27,44 @@ jobs:
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           build
 
+      - name: Embed App Group / Keychain entitlements via ad-hoc signing
+        run: |
+          set -euo pipefail
+          APP="build-device/Build/Products/Release-iphoneos/GoutouJunshi.app"
+          test -d "$APP"
+          APPID="ai.goutoujunshi.chatios"
+          GROUP="group.ai.goutoujunshi.chatios"
+          make_ent() {
+            local out="$1"
+            local with_keychain="$2"
+            {
+              printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+              printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+              printf '%s\n' '<plist version="1.0"><dict>'
+              printf '%s\n' '  <key>com.apple.security.application-groups</key>'
+              printf '%s\n' '  <array><string>'"$GROUP"'</string></array>'
+              if [ "$with_keychain" = "yes" ]; then
+                printf '%s\n' '  <key>keychain-access-groups</key>'
+                printf '%s\n' '  <array><string>$(AppIdentifierPrefix)'"$APPID"'</string></array>'
+              fi
+              printf '%s\n' '</dict></plist>'
+            } > "$out"
+          }
+          make_ent /tmp/ent-app.plist yes
+          make_ent /tmp/ent-ext.plist yes
+          make_ent /tmp/ent-capture.plist no
+          for ext in "$APP"/PlugIns/*.appex; do
+            case "$ext" in
+              *GoutouCapture.appex) ent=/tmp/ent-capture.plist ;;
+              *) ent=/tmp/ent-ext.plist ;;
+            esac
+            codesign --force --sign - --timestamp=none --entitlements "$ent" "$ext"
+          done
+          codesign --force --sign - --timestamp=none --entitlements /tmp/ent-app.plist "$APP"
+          echo "--- 已嵌入的 entitlements ---"
+          codesign -d --entitlements :- "$APP" || true
+          codesign -d --entitlements :- "$APP"/PlugIns/GoutouKeyboard.appex || true
+
       - name: Package Payload/GoutouJunshi.ipa
         run: |
           set -euo pipefail
@@ -42,7 +80,7 @@ jobs:
           find "$APP/PlugIns" -maxdepth 1 -name '*.appex' -print || true
           ls -lh goutoujunshi-unsigned-ios.ipa
 
-      - name: Upload unsigned IPA
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: goutoujunshi-unsigned-ios-ipa
