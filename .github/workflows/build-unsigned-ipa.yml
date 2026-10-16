@@ -7,8 +7,8 @@ permissions:
   contents: read
 
 env:
-  # Sideloadly 用你的 Apple ID 重新签名时，Team ID 会被追加到 bundle id 后面，
-  # 这里预先把它写进 Info.plist 和 entitlements，让 App 与键盘用同一个钥匙串组。
+  # Sideloadly 用你的 Apple ID 重新签名时会把 Team ID 追加到 bundle id 后面；
+  # 这里把它写成常量，既用于 Info.plist 的钥匙串组，也用于 entitlements。
   GOUTOU_TEAM_ID: "7S8RQQ2V6C"
   GOUTOU_APP_GROUP: "group.ai.goutoujunshi.chatios"
   GOUTOU_APP_BUNDLE: "ai.goutoujunshi.chatios"
@@ -24,6 +24,68 @@ jobs:
 
       - name: Show Xcode version
         run: xcodebuild -version
+
+      - name: Patch credential storage (App Group mirror, no hardcoded keychain group)
+        run: |
+          python3 - <<'PY'
+          import sys
+          path = "Shared/Store.swift"
+          lines = open(path, encoding="utf-8").read().split("\n")
+
+          hit = 0
+          for i, l in enumerate(lines):
+              if "kSecAttrAccessGroup as String: group]" in l:
+                  lines[i] = l.replace(", kSecAttrAccessGroup as String: group]", "]")
+                  hit += 1
+          if hit != 1:
+              sys.exit("anchor access-group count = %d" % hit)
+
+          exact = {
+              "    static func read(_ name: String) throws -> String {": "    private static func keychainRead(_ name: String) throws -> String {",
+              "    static func write(_ value: String, name: String) throws {": "    private static func keychainWrite(_ value: String, name: String) throws {",
+              "    static func delete(_ name: String) throws {": "    private static func keychainDelete(_ name: String) throws {",
+          }
+          for i, l in enumerate(lines):
+              if l in exact:
+                  lines[i] = exact[l]
+
+          insert_at = None
+          for i, l in enumerate(lines):
+              if "private static func keychainDelete(_ name: String) throws {" in l:
+                  j = i
+                  while j < len(lines) and not lines[j].startswith("    #else"):
+                      j += 1
+                  insert_at = j
+                  break
+          if insert_at is None:
+              sys.exit("insert anchor not found")
+
+          wrappers = [
+              '    private static var mirror: UserDefaults? {',
+              '        guard let group = Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String, !group.isEmpty else { return nil }',
+              '        return UserDefaults(suiteName: group)',
+              '    }',
+              '    private static func mirrorKey(_ name: String) -> String { "goutou.secret." + name }',
+              '    static func read(_ name: String) throws -> String {',
+              '        if let value = try? keychainRead(name), !value.isEmpty { return value }',
+              '        return mirror?.string(forKey: mirrorKey(name)) ?? ""',
+              '    }',
+              '    static func write(_ value: String, name: String) throws {',
+              '        let value = value.trimmed',
+              '        guard !value.isEmpty, value.count <= 1024 else { throw GoutouError.invalid("请输入有效的 API Key") }',
+              '        let saved = (try? keychainWrite(value, name: name)) != nil',
+              '        mirror?.set(value, forKey: mirrorKey(name))',
+              '        guard saved || mirror != nil else { throw GoutouError.invalid("密钥保存失败，请检查共享钥匙串签名") }',
+              '    }',
+              '    static func delete(_ name: String) throws {',
+              '        try? keychainDelete(name)',
+              '        mirror?.removeObject(forKey: mirrorKey(name))',
+              '    }',
+          ]
+          lines[insert_at:insert_at] = wrappers
+          open(path, "w", encoding="utf-8").write("\n".join(lines))
+          print("patched", path, len(lines), "lines")
+          PY
 
       - name: Build device app without signing (Release)
         run: >
@@ -43,13 +105,9 @@ jobs:
           test -d "$APP"
           KEYCHAIN_GROUP="${GOUTOU_TEAM_ID}.${GOUTOU_APP_BUNDLE}"
           echo "keychain group = $KEYCHAIN_GROUP"
-
-          # 1) Info.plist：让 App 与键盘请求同一个钥匙串组（源码里读的就是这个键）
           /usr/libexec/PlistBuddy -c "Set :GoutouKeychainGroup $KEYCHAIN_GROUP" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :GoutouKeychainGroup $KEYCHAIN_GROUP" "$KBD/Info.plist"
           /usr/libexec/PlistBuddy -c "Print :GoutouKeychainGroup" "$APP/Info.plist"
-
-          # 2) entitlements
           make_ent() {
             local out="$1"
             local with_keychain="$2"
@@ -69,8 +127,6 @@ jobs:
           make_ent /tmp/ent-app.plist yes
           make_ent /tmp/ent-ext.plist yes
           make_ent /tmp/ent-capture.plist no
-
-          # 3) 由内向外 ad-hoc 签名（先扩展后主 App）
           for ext in "$KBD" "$CAP"; do
             case "$ext" in
               *GoutouCapture.appex) ent=/tmp/ent-capture.plist ;;
@@ -79,7 +135,6 @@ jobs:
             codesign --force --sign - --timestamp=none --entitlements "$ent" "$ext"
           done
           codesign --force --sign - --timestamp=none --entitlements /tmp/ent-app.plist "$APP"
-
           echo "--- 主 App entitlements ---"
           codesign -d --entitlements :- "$APP" || true
           echo "--- 键盘 entitlements ---"
@@ -94,9 +149,7 @@ jobs:
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry goutoujunshi-unsigned-ios.ipa Payload
-          echo "--- architectures ---"
           lipo -info "$APP/GoutouJunshi" || true
-          echo "--- embedded extensions ---"
           find "$APP/PlugIns" -maxdepth 1 -name '*.appex' -print || true
           ls -lh goutoujunshi-unsigned-ios.ipa
 
