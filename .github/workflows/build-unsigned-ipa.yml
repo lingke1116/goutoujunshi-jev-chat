@@ -166,6 +166,20 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :GoutouKeychainGroup $KEYCHAIN_GROUP" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :GoutouKeychainGroup $KEYCHAIN_GROUP" "$KBD/Info.plist"
           /usr/libexec/PlistBuddy -c "Print :GoutouKeychainGroup" "$APP/Info.plist"
+
+          # AltStore/AltSign 注册 App ID 时会用 App 名称，含中文会报错 3009（The name for this app is invalid）。
+          # 这里把基础名称改成 ASCII，同时补一份 zh-Hans 本地化，手机上仍显示「狗头军师」。
+          rename_bundle() {
+            local bundle="$1"; local ascii="$2"; local zh="$3"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $ascii" "$bundle/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleName $ascii" "$bundle/Info.plist"
+            mkdir -p "$bundle/zh-Hans.lproj"
+            printf '"CFBundleDisplayName" = "%s";\n"CFBundleName" = "%s";\n' "$zh" "$zh" > "$bundle/zh-Hans.lproj/InfoPlist.strings"
+          }
+          rename_bundle "$APP" "Goutou" "狗头军师"
+          rename_bundle "$KBD" "GoutouKeyboard" "狗头军师"
+          rename_bundle "$CAP" "GoutouCapture" "狗头军师"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
           make_ent() {
             local out="$1"
             local with_keychain="$2"
