@@ -6,6 +6,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # Sideloadly 用你的 Apple ID 重新签名时，Team ID 会被追加到 bundle id 后面，
+  # 这里预先把它写进 Info.plist 和 entitlements，让 App 与键盘用同一个钥匙串组。
+  GOUTOU_TEAM_ID: "7S8RQQ2V6C"
+  GOUTOU_APP_GROUP: "group.ai.goutoujunshi.chatios"
+  GOUTOU_APP_BUNDLE: "ai.goutoujunshi.chatios"
+
 jobs:
   unsigned-ipa:
     runs-on: macos-latest
@@ -27,13 +34,22 @@ jobs:
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           build
 
-      - name: Embed App Group / Keychain entitlements via ad-hoc signing
+      - name: Bake team-prefixed keychain group into Info.plist and entitlements
         run: |
           set -euo pipefail
           APP="build-device/Build/Products/Release-iphoneos/GoutouJunshi.app"
+          KBD="$APP/PlugIns/GoutouKeyboard.appex"
+          CAP="$APP/PlugIns/GoutouCapture.appex"
           test -d "$APP"
-          APPID="ai.goutoujunshi.chatios"
-          GROUP="group.ai.goutoujunshi.chatios"
+          KEYCHAIN_GROUP="${GOUTOU_TEAM_ID}.${GOUTOU_APP_BUNDLE}"
+          echo "keychain group = $KEYCHAIN_GROUP"
+
+          # 1) Info.plist：让 App 与键盘请求同一个钥匙串组（源码里读的就是这个键）
+          /usr/libexec/PlistBuddy -c "Set :GoutouKeychainGroup $KEYCHAIN_GROUP" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :GoutouKeychainGroup $KEYCHAIN_GROUP" "$KBD/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :GoutouKeychainGroup" "$APP/Info.plist"
+
+          # 2) entitlements
           make_ent() {
             local out="$1"
             local with_keychain="$2"
@@ -42,10 +58,10 @@ jobs:
               printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
               printf '%s\n' '<plist version="1.0"><dict>'
               printf '%s\n' '  <key>com.apple.security.application-groups</key>'
-              printf '%s\n' '  <array><string>'"$GROUP"'</string></array>'
+              printf '%s\n' '  <array><string>'"$GOUTOU_APP_GROUP"'</string></array>'
               if [ "$with_keychain" = "yes" ]; then
                 printf '%s\n' '  <key>keychain-access-groups</key>'
-                printf '%s\n' '  <array><string>$(AppIdentifierPrefix)'"$APPID"'</string></array>'
+                printf '%s\n' '  <array><string>'"$KEYCHAIN_GROUP"'</string></array>'
               fi
               printf '%s\n' '</dict></plist>'
             } > "$out"
@@ -53,7 +69,9 @@ jobs:
           make_ent /tmp/ent-app.plist yes
           make_ent /tmp/ent-ext.plist yes
           make_ent /tmp/ent-capture.plist no
-          for ext in "$APP"/PlugIns/*.appex; do
+
+          # 3) 由内向外 ad-hoc 签名（先扩展后主 App）
+          for ext in "$KBD" "$CAP"; do
             case "$ext" in
               *GoutouCapture.appex) ent=/tmp/ent-capture.plist ;;
               *) ent=/tmp/ent-ext.plist ;;
@@ -61,9 +79,11 @@ jobs:
             codesign --force --sign - --timestamp=none --entitlements "$ent" "$ext"
           done
           codesign --force --sign - --timestamp=none --entitlements /tmp/ent-app.plist "$APP"
-          echo "--- 已嵌入的 entitlements ---"
+
+          echo "--- 主 App entitlements ---"
           codesign -d --entitlements :- "$APP" || true
-          codesign -d --entitlements :- "$APP"/PlugIns/GoutouKeyboard.appex || true
+          echo "--- 键盘 entitlements ---"
+          codesign -d --entitlements :- "$KBD" || true
 
       - name: Package Payload/GoutouJunshi.ipa
         run: |
